@@ -1,11 +1,9 @@
 import esphome.codegen as cg
+from esphome.components import ble_client, climate
 import esphome.config_validation as cv
-from esphome.components import climate, ble_client
 from esphome.const import CONF_ID
 
-# based on @petapton work - introducing various changes
-
-CODEOWNERS = ["@petapton","@blafois"]
+CODEOWNERS = ["@fjgordillo86"]
 DEPENDENCIES = ["ble_client"]
 
 madoka_ns = cg.esphome_ns.namespace("madoka")
