@@ -1,5 +1,7 @@
 #include "madoka.h"
+
 #include "esphome/core/log.h"
+#include <utility>
 
 #ifdef USE_ESP32
 
@@ -8,82 +10,112 @@ namespace madoka {
 
 using namespace esphome::climate;
 
+static const uint16_t CMD_GET_SETTING_STATUS = 0x0020;
+static const uint16_t CMD_SET_SETTING_STATUS = 0x4020;
+static const uint16_t CMD_GET_OPERATION_MODE = 0x0030;
+static const uint16_t CMD_SET_OPERATION_MODE = 0x4030;
+static const uint16_t CMD_GET_SETPOINT = 0x0040;
+static const uint16_t CMD_SET_SETPOINT = 0x4040;
+static const uint16_t CMD_GET_FAN_SPEED = 0x0050;
+static const uint16_t CMD_SET_FAN_SPEED = 0x4050;
+static const uint16_t CMD_GET_SENSOR_INFORMATION = 0x0110;
+
 void Madoka::dump_config() { LOG_CLIMATE(TAG, "Daikin Madoka Climate Controller", this); }
 
-void Madoka::setup() { this->query_semaphore_ = xSemaphoreCreateRecursiveMutex(); }
+void Madoka::setup() { this->receive_semaphore_ = xSemaphoreCreateMutex(); }
 
-void Madoka::loop() {}
+void Madoka::loop() {
+  std::vector<uint8_t> chk = {};
+  if (xSemaphoreTake(this->receive_semaphore_, 0L)) {
+    if (!this->received_chunks_.empty()) {
+      chk = this->received_chunks_.front();
+      this->received_chunks_.pop();
+    }
+    xSemaphoreGive(this->receive_semaphore_);
+    if (!chk.empty()) {
+      this->process_incoming_chunk_(chk);
+    }
+  }
+  if (this->should_update_) {
+    this->should_update_ = false;
+    this->update();
+  }
+}
 
 void Madoka::control(const ClimateCall &call) {
   if (this->node_state != espbt::ClientState::ESTABLISHED)
     return;
   if (call.get_mode().has_value()) {
     ClimateMode mode = *call.get_mode();
-    std::vector<chunk> pkt;
-    uint8_t mode_ = 255, status_ = 0;
+    uint8_t mode_out = 255, status_out = 0;
     switch (mode) {
       case climate::CLIMATE_MODE_OFF:
-        status_ = 0;
+        status_out = 0;
         break;
       case climate::CLIMATE_MODE_HEAT_COOL:
-        status_ = 1;
-        mode_ = 2;
+        status_out = 1;
+        mode_out = 2;
         break;
       case climate::CLIMATE_MODE_COOL:
-        status_ = 1;
-        mode_ = 3;
+        status_out = 1;
+        mode_out = 3;
         break;
       case climate::CLIMATE_MODE_HEAT:
-        status_ = 1;
-        mode_ = 4;
+        status_out = 1;
+        mode_out = 4;
         break;
       case climate::CLIMATE_MODE_FAN_ONLY:
-        status_ = 1;
-        mode_ = 0;
+        status_out = 1;
+        mode_out = 0;
         break;
       case climate::CLIMATE_MODE_DRY:
-        status_ = 1;
-        mode_ = 1;
+        status_out = 1;
+        mode_out = 1;
         break;
       default:
         ESP_LOGW(TAG, "Unsupported mode: %d", mode);
         break;
     }
-    ESP_LOGI(TAG, "status: %d, mode: %d", status_, mode_);
-    if (mode_ != 255) {
-      this->query(BRC1H_FUNC_SET_OPERATION_MODE, message({0x20, 0x01, (uint8_t) mode_}), 600);
+    ESP_LOGD(TAG, "status: %d, mode: %d", status_out, mode_out);
+    if (mode_out != 255) {
+      this->query_(CMD_SET_OPERATION_MODE, std::vector<uint8_t>{0x20, 0x01, (uint8_t) mode_out}, 600);
     }
-    this->query(BRC1H_FUNC_SET_SETTING_STATUS, message({0x20, 0x01, (uint8_t) status_}), 200);
+    this->query_(CMD_SET_SETTING_STATUS, std::vector<uint8_t>{0x20, 0x01, (uint8_t) status_out}, 200);
   }
   if (call.get_target_temperature().has_value()) {
-        uint16_t target = *call.get_target_temperature() * 128;
-        this->query(BRC1H_FUNC_SET_SETPOINT,
-                    message({0x20, 0x02, (uint8_t)((target >> 8) & 0xFF), (uint8_t)(target & 0xFF), 0x21, 0x02,
-                            (uint8_t)((target >> 8) & 0xFF), (uint8_t)(target & 0xFF)}),
-                    400);   
+    uint16_t target = *call.get_target_temperature() * 128;
+  
+    this->query_(CMD_SET_SETPOINT,
+                 std::vector<uint8_t>{0x20, 0x02, (uint8_t) ((target >> 8) & 0xFF), (uint8_t) (target & 0xFF),
+                                      0x21, 0x02, (uint8_t) ((target >> 8) & 0xFF), (uint8_t) (target & 0xFF)},
+                 400);
   }
   if (call.get_fan_mode().has_value()) {
-    ClimateFanMode mode = *call.get_fan_mode();
-    uint8_t fan_speed_ = 255;
-    switch(mode) {
-        case climate::CLIMATE_FAN_LOW:
-            fan_speed_ = 1;
-            break;
-        case climate::CLIMATE_FAN_MEDIUM:
-            fan_speed_ = 3;
-            break;
-        case climate::CLIMATE_FAN_HIGH:
-            fan_speed_ = 5;
-            break;
-        default:
-            ESP_LOGW(TAG, "Unsupported fan mode: %d", mode);
-            break;
+    uint8_t fan_mode = call.get_fan_mode().value();
+    uint8_t fan_mode_out = 255;
+    switch (fan_mode) {
+      case climate::CLIMATE_FAN_AUTO:
+        fan_mode_out = 0;
+        break;
+      case climate::CLIMATE_FAN_LOW:
+        fan_mode_out = 1;
+        break;
+      case climate::CLIMATE_FAN_MEDIUM:
+        fan_mode_out = 3;
+        break;
+      case climate::CLIMATE_FAN_HIGH:
+        fan_mode_out = 5;
+        break;
+      default:
+        ESP_LOGW(TAG, "Unsupported fan mode: %d", fan_mode);
+        break;
     }
-    if(fan_speed_ != 255) {
-        this->query(BRC1H_FUNC_SET_FANSPEED, message({0x20, 0x01, (uint8_t) fan_speed_, 0x21, 0x01, (uint8_t) fan_speed_}), 400);
+    if (fan_mode_out != 255) {
+      this->query_(CMD_SET_FAN_SPEED,
+                   std::vector<uint8_t>{0x20, 0x01, (uint8_t) fan_mode_out, 0x21, 0x01, (uint8_t) fan_mode_out}, 200);
     }
   }
-  this->update();
+  this->should_update_ = true;
 }
 
 void Madoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
@@ -100,8 +132,8 @@ void Madoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_para
         ESP_LOGE(TAG, "Authentication failed, status: 0x%x", param->ble_security.auth_cmpl.fail_reason);
         break;
       }
-      auto nfy = this->parent_->get_characteristic(MADOKA_SERVICE_UUID, NOTIFY_CHARACTERISTIC_UUID);
-      auto wwr = this->parent_->get_characteristic(MADOKA_SERVICE_UUID, WWR_CHARACTERISTIC_UUID);
+      auto *nfy = this->parent_->get_characteristic(MADOKA_SERVICE_UUID, NOTIFY_CHARACTERISTIC_UUID);
+      auto *wwr = this->parent_->get_characteristic(MADOKA_SERVICE_UUID, WWR_CHARACTERISTIC_UUID);
       if (nfy == nullptr || wwr == nullptr) {
         ESP_LOGW(TAG, "[%s] No control service found at device, not a Daikin Madoka..?", this->get_name().c_str());
         break;
@@ -152,10 +184,11 @@ void Madoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc
         ESP_LOGW(TAG, "Different notify handle");
         break;
       }
-      chunk chk = chunk(param->notify.value, param->notify.value + param->notify.value_len);
-      // ESP_LOGD(TAG, "Start process_incoming_chunk");
-      this->process_incoming_chunk(chk);
-      // ESP_LOGD(TAG, "End process_incoming_chunk");
+      std::vector<uint8_t> chk =
+          std::vector<uint8_t>{param->notify.value, param->notify.value + param->notify.value_len};
+      xSemaphoreTake(this->receive_semaphore_, portMAX_DELAY);
+      this->received_chunks_.push(chk);
+      xSemaphoreGive(this->receive_semaphore_);
       break;
     }
     default:
@@ -170,126 +203,123 @@ void Madoka::update() {
     return;
   }
 
-  std::vector<uint16_t> all_cmds({ BRC1H_FUNC_GET_SETTING_STATUS, BRC1H_FUNC_GET_OPERATION_MODE, BRC1H_FUNC_GET_SETPOINT, BRC1H_FUNC_GET_FANSPEED, BRC1H_FUNC_GET_SENSOR_INFORMATION});
+  std::vector<uint16_t> all_cmds{CMD_GET_SETTING_STATUS, CMD_GET_OPERATION_MODE, CMD_GET_SETPOINT, CMD_GET_FAN_SPEED,
+                                 CMD_GET_SENSOR_INFORMATION};
   for (auto cmd : all_cmds) {
-    this->query(cmd, message({0x00, 0x00}), 200);
+    this->query_(cmd, std::vector<uint8_t>{0x00, 0x00}, 50);
   }
 }
 
-bool validate_buffer(message buffer) { return buffer[0] == buffer.size(); }
+bool validate_buffer(std::vector<uint8_t> buffer) { return buffer[0] == buffer.size(); }
 
-void Madoka::process_incoming_chunk(chunk chk) {
+void Madoka::process_incoming_chunk_(std::vector<uint8_t> chk) {
   if (chk.size() < 2) {
     ESP_LOGI(TAG, "Chunk discarded: invalid length.");
     return;
   }
   uint8_t chunk_id = chk[0];
-  message stripped(chk.begin() + 1, chk.end());
+  std::vector<uint8_t> stripped{chk.begin() + 1, chk.end()};
   if (chunk_id == 0 && validate_buffer(stripped)) {
-    this->parse_cb(stripped);
+    this->parse_cb_(stripped);
     return;
   }
-  if (this->chunks.count(chunk_id)) {
-    ESP_LOGE(TAG, "Another packet with the same chunk ID is already in the buffer.");
+  if (this->pending_chunks_.count(chunk_id)) {
+    ESP_LOGE(TAG, "Another packet with the same std::vector<uint8_t> ID is already in the buffer.");
     ESP_LOGD(TAG, "Chunk ID: %d.", chunk_id);
     return;
   }
-  this->chunks[chunk_id] = chk;
+  this->pending_chunks_[chunk_id] = chk;
 
-  if (this->chunks.size() != this->chunks.rbegin()->first + 1) {
+  if (this->pending_chunks_.size() != this->pending_chunks_.rbegin()->first + 1) {
     ESP_LOGW(TAG, "Buffer is missing packets");
     return;
   }
 
-  message msg;
-  int lim = this->chunks.size();
+  std::vector<uint8_t> msg;
+  int lim = this->pending_chunks_.size();
   for (int i = 0; i < lim; i++) {
-    msg.insert(msg.end(), this->chunks[i].begin() + 1, this->chunks[i].end());
+    msg.insert(msg.end(), this->pending_chunks_[i].begin() + 1, this->pending_chunks_[i].end());
   }
   if (validate_buffer(msg)) {
-    this->chunks.clear();
-    this->parse_cb(msg);
+    this->pending_chunks_.clear();
+    this->parse_cb_(msg);
   }
 }
 
-std::vector<chunk> Madoka::split_payload(message msg) {
-  std::vector<chunk> result;
+std::vector<std::vector<uint8_t>> Madoka::split_payload_(std::vector<uint8_t> msg) {
+  std::vector<std::vector<uint8_t>> result;
   size_t len = msg.size();
-  result.push_back(chunk({0x00, (uint8_t)(len + 1)}));
-  result[0].insert(result[0].end(), msg.begin(), min(msg.begin() + (MAX_CHUNK_SIZE - 2), msg.end()));
-  int i = 0;
-  for (i = 1; i < len / (MAX_CHUNK_SIZE - 1); i++) {  // from second to second-last
-    result.push_back(
-        chunk(msg.begin() + ((MAX_CHUNK_SIZE - 1) * i - 1), msg.begin() + ((MAX_CHUNK_SIZE - 1) * (i + 1) - 1)));
+
+  // Add leading length byte
+  std::vector<uint8_t> buf{(uint8_t) (len + 1)};
+  buf.insert(buf.end(), msg.begin(), msg.end());
+
+  for (size_t i = 0; i <= len / (MAX_CHUNK_SIZE - 1); i++) {
+    std::vector<uint8_t> chunk{(uint8_t) i};
+    chunk.insert(chunk.end(), buf.begin() + (i * (MAX_CHUNK_SIZE - 1)),
+                 std::min(buf.end(), buf.begin() + ((i + 1) * (MAX_CHUNK_SIZE - 1))));
+
+    result.push_back(chunk);
   }
-  if (len > 18) {
-    i++;
-    result.push_back(chunk(msg.begin() + ((MAX_CHUNK_SIZE - 1) * i), msg.end()));
-  }
+
   return result;
 }
 
-message Madoka::prepare_message(uint16_t cmd, message args) {
-  message result({0x00, (uint8_t)((cmd >> 8) & 0xFF), (uint8_t)(cmd & 0xFF)});
+std::vector<uint8_t> Madoka::prepare_message_(uint16_t cmd, std::vector<uint8_t> args) {
+  std::vector<uint8_t> result({0x00, (uint8_t) ((cmd >> 8) & 0xFF), (uint8_t) (cmd & 0xFF)});
   result.insert(result.end(), args.begin(), args.end());
   return result;
 }
 
-void Madoka::query(uint16_t cmd, message args, int t_d) {
-  message payload = this->prepare_message(cmd, args);
+void Madoka::query_(uint16_t cmd, std::vector<uint8_t> args, int t_d) {
+  std::vector<uint8_t> payload = this->prepare_message_(cmd, std::move(args));
 
-  while (!xSemaphoreTakeRecursive(this->query_semaphore_, portMAX_DELAY)) {
-    delay(10);
-  }
   if (this->node_state != espbt::ClientState::ESTABLISHED) {
     return;
-  } else {
-    std::vector<chunk> chunks = this->split_payload(payload);
+  }
+  std::vector<std::vector<uint8_t>> chunks = this->split_payload_(payload);
 
-    for (auto chk : chunks) {
-      esp_err_t status;
-      for (int j = 0; j < BLE_SEND_MAX_RETRIES; j++) {
-        status =
-            esp_ble_gattc_write_char(this->parent_->get_gattc_if(), this->parent_->get_conn_id(), this->wwr_handle_,
-                                     chk.size(), &chk[0], ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
-        if (!status) {
-          break;
-        }
-        ESP_LOGD(TAG, "[%s] esp_ble_gattc_write_char failed (%d of %d), status=%d",
-                 this->parent_->address_str().c_str(), j + 1, BLE_SEND_MAX_RETRIES, status);
+  for (auto chk : chunks) {
+    esp_err_t status;
+    for (int j = 0; j < BLE_SEND_MAX_RETRIES; j++) {
+      status = esp_ble_gattc_write_char(this->parent_->get_gattc_if(), this->parent_->get_conn_id(), this->wwr_handle_,
+                                        chk.size(), chk.data(), ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+      if (!status) {
+        break;
       }
-      if (status) {
-        ESP_LOGE(TAG, "[%s] Command could not be sent, last status=%d", this->parent_->address_str().c_str(), status);
-        return;
-      }
+      ESP_LOGD(TAG, "[%s] esp_ble_gattc_write_char failed (%d of %d), status=%d", this->parent_->address_str().c_str(),
+               j + 1, BLE_SEND_MAX_RETRIES, status);
+    }
+    if (status) {
+      ESP_LOGE(TAG, "[%s] Command could not be sent, last status=%d", this->parent_->address_str().c_str(), status);
+      return;
     }
   }
   delay(t_d);
-  xSemaphoreGiveRecursive(this->query_semaphore_);
 }
 
-void Madoka::parse_cb(message msg) {
-  uint16_t f_id = msg[2] << 8 | msg[3];
+void Madoka::parse_cb_(std::vector<uint8_t> msg) {
+  uint16_t function_id = msg[2] << 8 | msg[3];
   uint8_t i = 4;
-  uint8_t sz = msg.size();
+  uint8_t message_size = msg.size();
 
-  switch (f_id) {
-    case BRC1H_FUNC_GET_SETTING_STATUS:
-      while (i < sz) {
-        uint8_t a_id = msg[i++];
+  switch (function_id) {
+    case CMD_GET_SETTING_STATUS:
+      while (i < message_size) {
+        uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
-        if (a_id == 0x20) {
-          message val(msg.begin() + i, msg.begin() + i + len);
+        if (argument_id == 0x20) {
+          std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
           this->cur_status_.status = val[0];
         }
         i += len;
       }
-    case BRC1H_FUNC_GET_OPERATION_MODE:
-      while (i < sz) {
-        uint8_t a_id = msg[i++];
+    case CMD_GET_OPERATION_MODE:
+      while (i < message_size) {
+        uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
-        if (a_id == 0x20) {
-          message val(msg.begin() + i, msg.begin() + i + len);
+        if (argument_id == 0x20) {
+          std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
           this->cur_status_.mode = val[0];
         }
         i += len;
@@ -297,9 +327,9 @@ void Madoka::parse_cb(message msg) {
     default:
       break;
   }
-  switch (f_id) {
-    case BRC1H_FUNC_GET_SETTING_STATUS:
-    case BRC1H_FUNC_GET_OPERATION_MODE:
+  switch (function_id) {
+    case CMD_GET_SETTING_STATUS:
+    case CMD_GET_OPERATION_MODE:
       // ESP_LOGI(TAG, "status: %d, mode: %d", this->cur_status_.status, this->cur_status_.mode);
       if (this->cur_status_.status) {
         switch (this->cur_status_.mode) {
@@ -323,98 +353,62 @@ void Madoka::parse_cb(message msg) {
         this->mode = climate::CLIMATE_MODE_OFF;
       }
       break;
-    case BRC1H_FUNC_GET_SETPOINT:
-      while (i < sz) {
-        uint8_t a_id = msg[i++];
+    case CMD_GET_SETPOINT:
+      while (i < message_size) {
+        uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
-        // we need to check the current mode.
-        // if we are in HEATING, we consider heating setpoint
-        // if we are in COOLING, we consider cooling setpoint
-        // if auto ... ?
-        switch (a_id) {
-          case 0x20: { // Cooling Setpoint
-            if(this->mode == climate::CLIMATE_MODE_COOL) {
-                message val(msg.begin() + i, msg.begin() + i + len);
-                this->target_temperature = (float) (val[0] << 8 | val[1]) / 128;
-            }
+        switch (argument_id) {
+          case 0x20: {
+            std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+            this->target_temperature = (float) (val[0] << 8 | val[1]) / 128;
             break;
           }
-          case 0x21: { // Heating Setpoint
-            if(this->mode == climate::CLIMATE_MODE_HEAT) {
-                message val(msg.begin() + i, msg.begin() + i + len);
-                this->target_temperature = (float) (val[0] << 8 | val[1]) / 128;
-            }
+          case 0x21: {
+            std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+            this->target_temperature = (float) (val[0] << 8 | val[1]) / 128;
             break;
           }
         }
         i += len;
       }
       break;
-    case BRC1H_FUNC_GET_FANSPEED:
-         ESP_LOGD(TAG, "[%s] Got fan speed return!", this->get_name().c_str());
-        // depending on current mode, we consider cooling or heating fanspeed
-        while (i < sz) {
-            uint8_t a_id = msg[i++];
-            uint8_t len = msg[i++];
-            // we need to check the current mode.
-            // if we are in HEATING, we consider heating fanspeed
-            // if we are in COOLING, we consider cooling fanspeed
-            // if auto ... ?
-            switch (a_id) {
-                case 0x20: { // Cooling FanSpeed
-                    if(this->mode == climate::CLIMATE_MODE_COOL) {
-                        message val(msg.begin() + i, msg.begin() + i + len);
-                        switch(val[0]) {
-                            case 1: 
-                                this->fan_mode = climate::CLIMATE_FAN_LOW;
-                                break;
-                            case 2:
-                            case 3: 
-                            case 4:
-                                this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
-                                break;
-                            case 5: 
-                                this->fan_mode = climate::CLIMATE_FAN_HIGH;
-                                break;
-                            default:
-                                ESP_LOGW(TAG, "[%s] Unsupported fan speed", this->get_name().c_str());
-                                break;
-                        }
-                    }
-                    break;
-                }
-                case 0x21: { // Heating FanSpeed
-                    if(this->mode == climate::CLIMATE_MODE_HEAT) {
-                        message val(msg.begin() + i, msg.begin() + i + len);
-                        switch(val[0]) {
-                            case 1: 
-                                this->fan_mode = climate::CLIMATE_FAN_LOW;
-                                break;
-                            case 2:
-                            case 3: 
-                            case 4:
-                                this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
-                                break;
-                            case 5: 
-                                this->fan_mode = climate::CLIMATE_FAN_HIGH;
-                                break;
-                            default:
-                                ESP_LOGW(TAG, "[%s] Unsupported fan speed", this->get_name().c_str());
-                                break;
-                        }
-                    }
-                    break;
-                }
-            }
-            i += len;
-        }
-        break;
-    case BRC1H_FUNC_GET_SENSOR_INFORMATION:
-      while (i < sz) {
-        uint8_t a_id = msg[i++];
+    case CMD_GET_FAN_SPEED: {
+      uint8_t fan_mode = 255;
+      while (i < message_size) {
+        uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
-        if (a_id == 0x40) {
-          message val(msg.begin() + i, msg.begin() + i + len);
+        if (this->cur_status_.mode == 1) {
+        } else if ((argument_id == 0x21 && len == 1 && this->cur_status_.mode == 4) ||
+                   (argument_id == 0x20 && len == 1 && this->cur_status_.mode != 4)) {
+          fan_mode = msg[i];
+        }
+        i += len;
+      }
+      switch (fan_mode) {
+        case 0:
+          this->fan_mode = climate::CLIMATE_FAN_AUTO;
+          break;
+        case 1:
+          this->fan_mode = climate::CLIMATE_FAN_LOW;
+          break;
+        case 2:
+        case 3:
+        case 4:
+          this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
+          break;
+        case 5:
+          this->fan_mode = climate::CLIMATE_FAN_HIGH;
+        default:
+          break;
+      }
+      break;
+    }
+    case CMD_GET_SENSOR_INFORMATION:
+      while (i < message_size) {
+        uint8_t argument_id = msg[i++];
+        uint8_t len = msg[i++];
+        if (argument_id == 0x40) {
+          std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
           this->current_temperature = val[0];
         }
         i += len;
